@@ -3,6 +3,8 @@
 use crate::sys::utils::get_all_data;
 use crate::{utils, DiskExt, DiskType};
 
+use itertools::Itertools;
+
 use libc::statvfs;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -90,9 +92,6 @@ fn new_disk(
             let bavail = cast!(stat.f_bavail);
             total = bsize.saturating_mul(blocks);
             available = bsize.saturating_mul(bavail);
-        }
-        if total == 0 {
-            return None;
         }
         let mount_point = mount_point.to_owned();
         let is_removable = removable_entries
@@ -207,45 +206,50 @@ fn get_all_disks_inner(content: &str) -> Vec<Disk> {
             // http://man7.org/linux/man-pages/man5/fstab.5.html
             // fs_spec<tab>fs_file<tab>fs_vfstype<tab>other fields
             let mut fields = line.split_whitespace();
-            let fs_spec = fields.next().unwrap_or("");
-            let fs_file = fields
-                .next()
-                .unwrap_or("")
-                .replace("\\134", "\\")
-                .replace("\\040", " ")
-                .replace("\\011", "\t")
-                .replace("\\012", "\n");
-            let fs_vfstype = fields.next().unwrap_or("");
-            (fs_spec, fs_file, fs_vfstype)
+            let _major = fields.next().unwrap_or("");
+            let _minor = fields.next().unwrap_or("");
+            let _blocks = fields.next().unwrap_or("");
+            let name = fields.next().unwrap_or("");
+            name
         })
-        .filter(|(fs_spec, fs_file, fs_vfstype)| {
-            // Check if fs_vfstype is one of our 'ignored' file systems.
+        .filter(|name| {
+            // Check if name is one of our 'ignored' devicesU.
             let filtered = matches!(
-                *fs_vfstype,
-                "rootfs" | // https://www.kernel.org/doc/Documentation/filesystems/ramfs-rootfs-initramfs.txt
-                "sysfs" | // pseudo file system for kernel objects
-                "proc" |  // another pseudo file system
-                "tmpfs" |
-                "devtmpfs" |
-                "cgroup" |
-                "cgroup2" |
-                "pstore" | // https://www.kernel.org/doc/Documentation/ABI/testing/pstore
-                "squashfs" | // squashfs is a compressed read-only file system (for snaps)
-                "rpc_pipefs" | // The pipefs pseudo file system service
-                "iso9660" // optical media
+                *name,
+                "name" |
+                ""
             );
-
             !(filtered ||
-               fs_file.starts_with("/sys") || // check if fs_file is an 'ignored' mount point
-               fs_file.starts_with("/proc") ||
-               (fs_file.starts_with("/run") && !fs_file.starts_with("/run/media")) ||
-               fs_spec.starts_with("sunrpc"))
+                name.starts_with("loop") |
+                name.starts_with("sr")
+            )
         })
-        .filter_map(|(fs_spec, fs_file, fs_vfstype)| {
+        .map(|name| {
+            let mut chars_iter = name.chars();
+            let last = chars_iter.next_back().unwrap();
+            let second_last = chars_iter.last().unwrap();
+
+            let is_nvme = name.starts_with("nvme");
+            let is_partition = if is_nvme {
+                second_last == 'p'
+            } else {
+                last.is_digit(10)
+            };
+
+            let strip_size: usize = match is_nvme {
+                true => if is_partition { 2 } else { 0 },
+                false => if is_partition { 1 } else { 0 }
+            };
+            let m_name = name.to_owned();
+            let block_dev = m_name[..name.len().checked_sub(strip_size).unwrap_or(name.len())].to_owned();
+            block_dev
+        })
+        .unique()
+        .filter_map(|name| {
             new_disk(
-                fs_spec.as_ref(),
-                Path::new(&fs_file),
-                fs_vfstype.as_bytes(),
+                name.as_ref(),
+                Path::new(&""),
+                "".as_bytes(),
                 &removable_entries,
             )
         })
@@ -253,7 +257,7 @@ fn get_all_disks_inner(content: &str) -> Vec<Disk> {
 }
 
 pub(crate) fn get_all_disks() -> Vec<Disk> {
-    get_all_disks_inner(&get_all_data("/proc/mounts", 16_385).unwrap_or_default())
+    get_all_disks_inner(&get_all_data("/proc/partitions", 16_385).unwrap_or_default())
 }
 
 // #[test]
